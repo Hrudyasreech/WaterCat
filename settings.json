@@ -1,0 +1,4 @@
+{
+    "reminder_interval_ms": 3600000,
+    "snooze_interval_ms": 300000
+}

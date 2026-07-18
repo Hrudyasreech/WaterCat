@@ -3,18 +3,22 @@ from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QApplication
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtCore import QObject, QTimer, Qt
 import src.config as config
+import src.db as db
 from src.ui.reminder_window import ReminderWindow
+from src.ui.settings_window import SettingsWindow
 
 class AppState:
     IDLE = "IDLE"
     WALKING_IN = "WALKING_IN"
     PROMPTING = "PROMPTING"
+    SITTING_DOWN = "SITTING_DOWN"
     DRINKING = "DRINKING"
     HAPPY = "HAPPY"
     WALKING_OUT = "WALKING_OUT"
     SAD = "SAD"
     SLEEPING = "SLEEPING"
-    WAKING = "WAKING"
+    SLEEPING_STIR = "SLEEPING_STIR"
+    SLEEPING_WAKE = "SLEEPING_WAKE"
 
 class WaterCatController(QObject):
     """Main application controller coordinating state changes, timers, and background execution."""
@@ -38,8 +42,11 @@ class WaterCatController(QObject):
         self.window = ReminderWindow(self.anim_manager)
         
         # Connect UI Signals
-        self.window.drank_clicked.connect(self.on_drank_clicked)
+        self.window.drank_clicked.connect(self.on_drank_water)
         self.window.snooze_clicked.connect(self.on_snooze_clicked)
+        
+        # Initialize Database
+        db.init_db()
         
         # Connect Animation Finished signal
         self.anim_manager.animation_finished.connect(self.on_animation_finished)
@@ -94,6 +101,12 @@ class WaterCatController(QObject):
         
         menu.addSeparator()
         
+        settings_action = QAction("Settings", self)
+        settings_action.triggered.connect(self.open_settings)
+        menu.addAction(settings_action)
+        
+        menu.addSeparator()
+        
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.quit_app)
         menu.addAction(exit_action)
@@ -106,11 +119,21 @@ class WaterCatController(QObject):
         if self.state == AppState.IDLE:
             self.trigger_reminder()
 
+    def open_settings(self):
+        """Opens the settings dialog."""
+        print("Settings menu clicked!")
+        self.settings_window = SettingsWindow(
+            current_reminder_ms=self.reminder_interval_ms,
+            current_snooze_ms=self.snooze_interval_ms,
+            on_save_callback=self.set_intervals
+        )
+        self.settings_window.exec()
+
     def reset_reminder(self):
         """Resets the reminder timer."""
         self.start_reminder_timer()
         # If sleeping/snoozing, reset back to idle
-        if self.state in [AppState.SLEEPING, AppState.SAD, AppState.WAKING]:
+        if self.state in [AppState.SLEEPING, AppState.SLEEPING_STIR, AppState.SLEEPING_WAKE, AppState.SAD]:
             self.snooze_timer.stop()
             self.window.hide()
             self.anim_manager.stop()
@@ -124,50 +147,73 @@ class WaterCatController(QObject):
         self.window.start_walk_in(self.on_walk_in_complete)
 
     def on_walk_in_complete(self):
-        """Cat finished walking in, show the speech bubble and await input."""
-        self.state = AppState.PROMPTING
-        # Stop walk loop and play standing idle pose (happy/wake frame or walk frame 0 static)
-        # Using a quiet standing state
-        self.anim_manager.play("walk", loop=False) # Plays once and stops on frame 7 or 0
-        self.window.show_bubble()
+        """Cat finished walking in — play sit-down animation once, facing left."""
+        self.state = AppState.SITTING_DOWN
+        self.window.set_mirror(False)   # idle/sad sprites face left by default
+        self.anim_manager.play("sad", loop=False)
 
-    def on_drank_clicked(self):
-        """State transitions when 'I Drank Water' is clicked."""
+    def on_drank_water(self):
+        """State transitions when 'I Drank' is clicked."""
         self.state = AppState.HAPPY
         self.window.bubble.hide()
-        # Play happy celebration animation immediately slowly (180ms per frame)
+        
+        # Record drink in DB
+        db.record_drink()
+        
+        # Play happy celebration animation once (180ms per frame)
         self.anim_manager.play("happy", loop=False, interval_ms=180)
 
     def on_snooze_clicked(self):
         """State transitions when 'Snooze 5 Min' is clicked."""
         self.state = AppState.SAD
         self.window.bubble.hide()
-        # Play sad animation (non-looping)
-        self.anim_manager.play("sad", loop=False)
+        self.window.set_mirror(True)
+        # Play sad animation (non-looping, slightly slower for effect)
+        self.anim_manager.play("sad", loop=False, interval_ms=400)
 
     def on_animation_finished(self):
         """Handles state changes triggered by non-looping animation endings."""
-        if self.state == AppState.HAPPY:
-            self.state = AppState.WALKING_OUT
-            # Walk out of screen, then hide
-            self.window.start_walk_out(self.on_walk_out_complete)
-            
-        elif self.state == AppState.SAD:
-            self.state = AppState.SLEEPING
-            # Sleep looping animation
-            self.anim_manager.play("sleep", loop=True)
-            # Start the snooze timer
-            self.snooze_timer.start(self.snooze_interval_ms)
-            print(f"Snoozing for {self.snooze_interval_ms / 1000 / 60:.1f} minutes.")
-            
-        elif self.state == AppState.WAKING:
-            # Woken up, prompt again
+        if self.state == AppState.SITTING_DOWN:
+            # Sit down complete → show idle breathing/blinking animation + bubble
             self.state = AppState.PROMPTING
-            self.window.reset_button_states()
+            self.window.set_mirror(True)
+            self.anim_manager.play("idle", loop=True, interval_ms=10000)
+            self._update_bubble_text()
             self.window.show_bubble()
 
+        elif self.state == AppState.HAPPY:
+            # Happy dance finished → walk cat back off-screen to the right
+            self.state = AppState.WALKING_OUT
+            self.window.start_walk_out(self.on_walk_out_complete)
+
+        elif self.state == AppState.SAD:
+            self.state = AppState.SLEEPING
+            self.window.set_mirror(True)
+            self.anim_manager.play("sleep", loop=False)
+            # Snooze for the requested time minus 3 seconds for the stir sequence
+            self.snooze_timer.start(max(0, self.snooze_interval_ms - 3000))
+
+        elif self.state == AppState.SLEEPING_WAKE:
+            # Wake animation finished → return to idle prompt
+            self.state = AppState.PROMPTING
+            self.window.set_mirror(True)
+            self.anim_manager.play("idle", loop=True, interval_ms=10000)
+            self.window.reset_button_states()
+            self._update_bubble_text()
+            self.window.show_bubble()
+
+    def _update_bubble_text(self):
+        """Updates the speech bubble with the current day's streak."""
+        count = db.get_drinks_today()
+        if count == 0:
+            self.window.bubble.set_text("Time to drink some water!")
+        elif count == 1:
+            self.window.bubble.set_text("You've had 1 glass today! Another?")
+        else:
+            self.window.bubble.set_text(f"You've had {count} glasses today! Another?")
+
     def on_walk_out_complete(self):
-        """Cat walked off screen, close window and return to IDLE."""
+        """Cat walked off screen — hide window and return to IDLE."""
         self.window.hide()
         self.anim_manager.stop()
         self.state = AppState.IDLE
@@ -175,10 +221,14 @@ class WaterCatController(QObject):
 
     def on_snooze_timeout(self):
         """Timer callback when snooze finishes."""
-        self.snooze_timer.stop()
-        self.state = AppState.WAKING
-        # Play wake up animation
-        self.anim_manager.play("wake", loop=False)
+        if self.state == AppState.SLEEPING:
+            self.state = AppState.SLEEPING_STIR
+            self.anim_manager.play("sleep_stir", loop=True)
+            self.snooze_timer.start(3000)
+        elif self.state == AppState.SLEEPING_STIR:
+            self.state = AppState.SLEEPING_WAKE
+            self.snooze_timer.stop()
+            self.anim_manager.play("sleep_wake", loop=False)
 
     def quit_app(self):
         """Gracefully shuts down the application."""

@@ -1,9 +1,12 @@
 import os
 import sys
 
+import json
+
 # Base directories
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 
 # Ensure assets dir exists
 os.makedirs(ASSETS_DIR, exist_ok=True)
@@ -12,22 +15,36 @@ os.makedirs(ASSETS_DIR, exist_ok=True)
 DEFAULT_REMINDER_INTERVAL = 60 * 60 * 1000  # 1 hour in milliseconds
 DEFAULT_SNOOZE_INTERVAL = 5 * 60 * 1000     # 5 minutes in milliseconds
 
+# Load user settings if they exist
+if os.path.exists(SETTINGS_FILE):
+    try:
+        with open(SETTINGS_FILE, "r") as f:
+            user_settings = json.load(f)
+            if "reminder_interval_ms" in user_settings:
+                DEFAULT_REMINDER_INTERVAL = user_settings["reminder_interval_ms"]
+            if "snooze_interval_ms" in user_settings:
+                DEFAULT_SNOOZE_INTERVAL = user_settings["snooze_interval_ms"]
+    except Exception as e:
+        print(f"Failed to load settings.json: {e}")
+
 # Animation settings
-FRAME_RATE_FPS = 10                         # 10 frames per second
-FRAME_DURATION_MS = 1000 // FRAME_RATE_FPS  # 100ms per frame
+FRAME_RATE_FPS = 5                          # 5 frames per second for natural speed
+FRAME_DURATION_MS = 1000 // FRAME_RATE_FPS  # 200ms per frame
 SPRITE_SCALE = 1                            # 1x native unscaled pixel-art resolution
 
 # Standard uniform dimensions for all cat sprites in the application
 TARGET_WIDTH = 128
 TARGET_HEIGHT = 123
 
-# Raw sprite sheet configs (used for correct horizontal slicing)
+# Folder names for individual frame images
 SPRITE_CONFIGS = {
-    "walk": {"filename": "walk.jpg", "frames": 8, "base_width": 128, "base_height": 123, "bg_threshold": 200},
-    "happy": {"filename": "happy2.jpg", "frames": 8, "base_width": 128, "base_height": 159, "crop_y": (196, 355), "bg_threshold": 175},
-    "sad": {"filename": "sad.jpg", "frames": 6, "base_width": 170.67, "base_height": 167, "bg_threshold": 200},
-    "sleep": {"filename": "sleep.jpg", "frames": 6, "base_width": 170.67, "base_height": 168, "bg_threshold": 200},
-    "wake": {"filename": "wake.jpg", "frames": 8, "base_width": 128, "base_height": 123, "bg_threshold": 200}
+    "walk": {"folder": "walk"},
+    "idle": {"folder": "idle", "frame_indices": [0, 1]},
+    "happy": {"folder": "happy_dance"},
+    "sad": {"folder": "sit_down", "frame_indices": [0, 2, 4, 6]},
+    "sleep": {"folder": "sleep_loop", "frame_indices": [0, 1, 2, 3]},
+    "sleep_stir": {"folder": "sleep_loop", "frame_indices": [3, 4]},
+    "sleep_wake": {"folder": "sleep_loop", "frame_indices": [4, 5, 6, 7, 0]}
 }
 
 # Typography

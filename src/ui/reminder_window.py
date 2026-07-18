@@ -1,201 +1,224 @@
 from PySide6.QtWidgets import QWidget, QHBoxLayout
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QGuiApplication, QPainter, QColor
+from PySide6.QtGui import QGuiApplication, QPainter
 import src.config as config
 from src.ui.bubble import PixelBubble
 from src.ui.button import PixelButton
-from src.ui.cat_widget import CatWidget
+from src.ui.animated_sprite import AnimatedSprite
+
 
 class ReminderWindow(QWidget):
-    """Frameless, transparent desktop popup displaying the companion and buttons."""
-    # Signals to communicate button clicks back to the main controller
+    """Full-screen-width transparent overlay that hosts the cat sprite and speech bubble.
+
+    Architecture:
+    - The window spans the FULL width of the screen and sits at the bottom edge.
+      Height is just enough to show the cat + bubble above it.
+    - The AnimatedSprite widget is a child positioned at (cat_x, cat_y) in screen-local
+      coordinates, where cat_x goes from off-screen right to the resting position.
+    - The speech bubble floats just above the sprite at the same x.
+    - A high-precision 60 FPS movement timer controls cat_x via velocity.
+    - A separate animation timer (inside AnimationManager) only advances frame indices.
+      These two timers are completely independent.
+    """
     drank_clicked = Signal()
     snooze_clicked = Signal()
+
+    # Sprite resting position: distance from right edge of screen to the cat center
+    REST_RIGHT_MARGIN = 130    # px from right edge of screen where cat sits
+
+    # Movement speed: pixels per 60 FPS tick
+    WALK_SPEED = 1.0           # ~60 px/sec
 
     def __init__(self, anim_manager, parent=None):
         super().__init__(parent)
         self.anim_manager = anim_manager
-        
-        # Windows-specific frameless, stay-on-top, and taskbar-less flags
+
         self.setWindowFlags(
-            Qt.FramelessWindowHint | 
-            Qt.WindowStaysOnTopHint | 
-            Qt.Tool | 
+            Qt.FramelessWindowHint |
+            Qt.WindowStaysOnTopHint |
+            Qt.Tool |
             Qt.SubWindow
         )
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-        
-        # Window size - scaled down to native size
-        self.window_width = 240
-        self.window_height = 220
-        self.resize(self.window_width, self.window_height)
-        
-        # Position at bottom-right corner of screen
-        self.reposition_to_bottom_right()
-        
-        # Cat walking parameters - starts off-screen right
-        self.cat_x = self.window_width
-        self.walk_target_x = 56         # Resting X position (centered: (240 - 128) // 2)
-        self.walk_direction = -1        # -1 = walking left (in), 1 = walking right (out)
-        self.is_walking = False
-        self.on_walk_complete = None
-        
-        self.setup_ui()
 
-    def setup_ui(self):
-        # 1. Create Speech Bubble (manual geometry positioning)
+        # Get screen dimensions
+        screen = QGuiApplication.primaryScreen()
+        rect = screen.availableGeometry() if screen else None
+        self.screen_x      = rect.x()      if rect else 0
+        self.screen_y      = rect.y()      if rect else 0
+        self.screen_w      = rect.width()  if rect else 1920
+        self.screen_h      = rect.height() if rect else 1080
+
+        # Window spans full screen width; tall enough for bubble + cat
+        self.win_h = config.TARGET_HEIGHT + 130   # 130px for bubble above cat
+        self.setGeometry(
+            self.screen_x,
+            self.screen_y + self.screen_h - self.win_h,
+            self.screen_w,
+            self.win_h
+        )
+
+        # Cat screen-local X coordinate (relative to this window's left edge)
+        # Starts fully off-screen to the right
+        self.cat_x = float(self.screen_w + config.TARGET_WIDTH)
+        # Y of sprite: bottom of window minus sprite height
+        self.cat_y = self.win_h - config.TARGET_HEIGHT
+
+        # Walk target: cat stops at this local x
+        self.rest_x = float(self.screen_w - self.REST_RIGHT_MARGIN - config.TARGET_WIDTH // 2)
+        # Off-screen right exit x
+        self.exit_x = float(self.screen_w + config.TARGET_WIDTH)
+
+        # Walking state
+        self.is_walking    = False
+        self.walk_velocity = 0.0      # positive = right, negative = left
+        self.walk_target_x = 0.0
+        self._walk_done_cb = None
+
+        # High-precision movement timer (60 FPS, independent of animation timer)
+        self._move_timer = QTimer(self)
+        self._move_timer.setTimerType(Qt.PreciseTimer)
+        self._move_timer.setInterval(16)          # ~62.5 FPS
+        self._move_timer.timeout.connect(self._on_move_tick)
+
+        # Horizontal mirror state
+        self._mirror = False
+
+        self._build_ui()
+
+        # Listen to frame changes only to update mirror flag (NOT to move the widget)
+        self.anim_manager.frame_changed.connect(self._on_frame_changed)
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        # Speech bubble (hidden until cat arrives)
         self.bubble = PixelBubble("Time to drink some water!", self)
-        # Custom size: 220px wide, 110px tall, placed with padding
-        self.bubble.setGeometry(10, 10, 220, 110)
-        
-        # Add buttons inside bubble's layout (below the text)
-        button_layout = QHBoxLayout()
-        button_layout.setSpacing(6)
-        button_layout.setContentsMargins(0, 4, 0, 0)
-        
-        # Shortened button text to fit nicely in 220px bubble
-        self.btn_drank = PixelButton("I Drank", is_primary=True)
-        self.btn_snooze = PixelButton("Snooze", is_primary=False)
-        
-        button_layout.addWidget(self.btn_drank)
-        button_layout.addWidget(self.btn_snooze)
-        
-        # Add layout to bubble
-        self.bubble.layout().addLayout(button_layout)
-        
-        # Connect buttons
-        self.btn_drank.clicked.connect(self.on_drank_water)
-        self.btn_snooze.clicked.connect(self.on_snooze)
-        
-        # 2. Create Cat Widget (direct child, manual geometry)
-        self.cat_widget = CatWidget(self.anim_manager, self)
-        
-        # Connect frame changes to coordinate both sprite rendering and walking movement
-        self.anim_manager.frame_changed.connect(self.on_cat_frame_changed)
-        
-        # Make sure bubble is initially hidden (cat walks in first)
+        self.bubble.setFixedSize(220, 110)
         self.bubble.hide()
 
-    def on_cat_frame_changed(self, pixmap):
-        """Callback triggered when the animation frame changes.
-        
-        Synchronizes the cat's coordinate updates directly with the animation ticks
-        and dynamically sets the mirroring flag.
-        """
-        if pixmap.isNull():
-            return
-            
-        anim_name = self.anim_manager.current_animation
-        h = int(pixmap.height() * config.SPRITE_SCALE)
-        y = self.window_height - h
-        
-        # Determine mirroring based on walk direction and animation name
-        if self.is_walking:
-            if self.walk_direction == -1:
-                # Walking left (in) -> Mirror to face right (moonwalk in)
-                self.cat_widget.mirror_horizontal = True
-            else:
-                # Walking right (out) -> No mirror to face left (moonwalk out)
-                self.cat_widget.mirror_horizontal = False
-        else:
-            # Idle/Acting states: Always face LEFT (towards the speech bubble/buttons)
-            if anim_name in ["walk", "sleep"]:
-                # Default direction in JPEG is left -> No mirror
-                self.cat_widget.mirror_horizontal = False
-            elif anim_name in ["happy", "sad", "wake"]:
-                # Default direction in JPEG is right -> Mirror to face left
-                self.cat_widget.mirror_horizontal = True
-                
-        # Walk coordinate update
-        if self.is_walking:
-            step = 8  
-            self.cat_x += self.walk_direction * step
-            
-            # Check if target reached
-            reached = False
-            if self.walk_direction == -1 and self.cat_x <= self.walk_target_x:
-                self.cat_x = self.walk_target_x
-                reached = True
-            elif self.walk_direction == 1 and self.cat_x >= self.walk_target_x:
-                self.cat_x = self.walk_target_x
-                reached = True
-                
-            if reached:
-                self.is_walking = False
-                if self.on_walk_complete:
-                    cb = self.on_walk_complete
-                    self.on_walk_complete = None
-                    # Defer callback to next event loop cycle
-                    QTimer.singleShot(0, cb)
-                    
-        self.cat_widget.move(self.cat_x, y)
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        btn_row.setContentsMargins(0, 4, 0, 0)
+        self.btn_drank  = PixelButton("I Drank",  is_primary=True)
+        self.btn_snooze = PixelButton("Snooze",   is_primary=False)
+        btn_row.addWidget(self.btn_drank)
+        btn_row.addWidget(self.btn_snooze)
+        self.bubble.layout().addLayout(btn_row)
 
+        self.btn_drank.clicked.connect(self.on_drank_water)
+        self.btn_snooze.clicked.connect(self.on_snooze)
+
+        # Animated sprite widget
+        self.sprite = AnimatedSprite(self.anim_manager, self)
+        self.sprite.resize(config.TARGET_WIDTH, config.TARGET_HEIGHT)
+        self.sprite.move(int(self.cat_x), self.cat_y)
+
+    # ------------------------------------------------------------------
+    # Frame-change callback — updates mirror only, does NOT move
+    # ------------------------------------------------------------------
+    def _on_frame_changed(self, pixmap):
+        self.sprite.mirror_horizontal = self._mirror
+        self.sprite.update()
+
+    # ------------------------------------------------------------------
+    # 60 FPS movement tick — updates cat_x via velocity, then moves sprite
+    # ------------------------------------------------------------------
+    def _on_move_tick(self):
+        self.cat_x += self.walk_velocity
+
+        # Check destination
+        reached = (
+            (self.walk_velocity < 0 and self.cat_x <= self.walk_target_x) or
+            (self.walk_velocity > 0 and self.cat_x >= self.walk_target_x)
+        )
+        if reached:
+            self.cat_x = self.walk_target_x
+            self.is_walking = False
+            self._move_timer.stop()
+            self.sprite.move(int(self.cat_x), self.cat_y)
+            if self._walk_done_cb:
+                cb, self._walk_done_cb = self._walk_done_cb, None
+                QTimer.singleShot(0, cb)
+            return
+
+        self.sprite.move(int(self.cat_x), self.cat_y)
+
+    # ------------------------------------------------------------------
+    # Public walk API
+    # ------------------------------------------------------------------
+    def start_walk_in(self, callback):
+        """Walk cat in from the right edge to the resting position."""
+        self.cat_x         = self.exit_x
+        self.walk_target_x = self.rest_x
+        self.walk_velocity = -self.WALK_SPEED   # moving left
+        self._walk_done_cb = callback
+        self._mirror       = True               # walk.png faces right → mirror to face left
+
+        self.is_walking = True
+        self.anim_manager.play("walk", loop=True)
+        self.sprite.move(int(self.cat_x), self.cat_y)
+        self._position_bubble()
+        self.bubble.hide()
+        self.show()
+        self._move_timer.start()
+
+    def start_walk_out(self, callback):
+        """Walk cat out to the right edge from its current resting position."""
+        self.walk_target_x = self.exit_x
+        self.walk_velocity = +self.WALK_SPEED   # moving right
+        self._walk_done_cb = callback
+        self._mirror       = False              # walk.png faces right → no mirror when walking right
+
+        self.is_walking = True
+        self.anim_manager.play("walk", loop=True)
+        self.bubble.hide()
+        self._move_timer.start()
+
+    # ------------------------------------------------------------------
+    # Bubble positioning
+    # ------------------------------------------------------------------
+    def _position_bubble(self):
+        """Place bubble centred above the resting cat position."""
+        bw = self.bubble.width()
+        bx = int(self.rest_x + config.TARGET_WIDTH // 2 - bw // 2)
+        by = self.cat_y - self.bubble.height() - 4
+        bx = max(4, min(bx, self.screen_w - bw - 4))
+        self.bubble.move(bx, by)
+
+    def show_bubble(self):
+        self._position_bubble()
+        self.bubble.show()
+
+    # ------------------------------------------------------------------
+    # Static state helpers
+    # ------------------------------------------------------------------
+    def set_mirror(self, mirror: bool):
+        self._mirror = mirror
+        self.sprite.mirror_horizontal = mirror
+        self.sprite.update()
+
+    # ------------------------------------------------------------------
+    # Qt overrides
+    # ------------------------------------------------------------------
     def paintEvent(self, event):
-        """Clears the background to transparent. Required for proper Windows desktop alpha blending."""
         painter = QPainter(self)
         painter.fillRect(self.rect(), Qt.transparent)
 
-    def reposition_to_bottom_right(self):
-        """Moves the window near the bottom-right corner of the primary screen."""
-        screen = QGuiApplication.primaryScreen()
-        if screen:
-            rect = screen.availableGeometry()
-            # 15px margin from screen edges
-            x = rect.x() + rect.width() - self.window_width - 15
-            y = rect.y() + rect.height() - self.window_height - 15
-            self.move(x, y)
-
-    def start_walk_in(self, callback):
-        """Starts the walk-in animation from the right of the window (moving left, facing right)."""
-        self.reposition_to_bottom_right()
-        self.bubble.hide()
-        
-        # Position cat off-screen right
-        self.cat_x = self.window_width
-        
-        # Initial Y position alignment
-        h = self.cat_widget.height()
-        self.cat_widget.move(self.cat_x, self.window_height - h)
-        self.show()
-        
-        # Set up walk-in parameters
-        self.is_walking = True
-        self.walk_direction = -1
-        self.walk_target_x = (self.window_width - self.cat_widget.width()) // 2
-        self.on_walk_complete = callback
-        
-        # Start walk animation
-        self.anim_manager.play("walk", loop=True)
-
-    def start_walk_out(self, callback):
-        """Starts the walk-out animation to the right of the window (moving right, facing right)."""
-        self.bubble.hide()
-        
-        self.is_walking = True
-        self.walk_direction = 1
-        self.walk_target_x = self.window_width
-        self.on_walk_complete = callback
-        
-        # Start walk animation
-        self.anim_manager.play("walk", loop=True)
-
-    def show_bubble(self):
-        """Displays the text speech bubble once the cat is in position."""
-        self.bubble.show()
-
+    # ------------------------------------------------------------------
+    # Button handlers
+    # ------------------------------------------------------------------
     def on_drank_water(self):
-        """Handles I Drank Water button click."""
         self.btn_drank.setEnabled(False)
         self.btn_snooze.setEnabled(False)
         self.drank_clicked.emit()
 
     def on_snooze(self):
-        """Handles Snooze button click."""
         self.btn_drank.setEnabled(False)
         self.btn_snooze.setEnabled(False)
         self.snooze_clicked.emit()
 
     def reset_button_states(self):
-        """Re-enables buttons for the next prompt."""
         self.btn_drank.setEnabled(True)
         self.btn_snooze.setEnabled(True)

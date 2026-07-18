@@ -12,8 +12,8 @@ class PixelButton(QPushButton):
     def setup_ui(self):
         # Set pixel font
         font = QFont("Press Start 2P")
-        # Pixel fonts render best at specific sizes (typically multiples of 8px/9px)
-        font.setPixelSize(8)
+        # Pixel fonts render best at specific sizes
+        font.setPixelSize(10)
         self.setFont(font)
         
         # Retro styling

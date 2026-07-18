@@ -14,11 +14,16 @@ class PixelBubble(QWidget):
         self.tail_offset_x = 40 
         self.setup_ui()
 
+    def set_text(self, text):
+        self.text = text
+        # Use HTML rich text to force line spacing since pixel fonts often have broken metrics
+        self.label.setText(f"<div style='line-height:1.5;'>{self.text}</div>")
+
     def setup_ui(self):
         # We need a layout to contain the text label
         layout = QVBoxLayout(self)
         # Add padding so the text fits inside the bubble frame
-        layout.setContentsMargins(12, 12, 12, 12 + self.tail_height)
+        layout.setContentsMargins(10, 10, 10, 10 + self.tail_height)
         
         self.label = QLabel(self.text, self)
         self.label.setWordWrap(True)
@@ -26,11 +31,11 @@ class PixelBubble(QWidget):
         
         # Load pixel font
         font = QFont("Press Start 2P")
-        font.setPixelSize(8)
+        font.setPixelSize(10)
         self.label.setFont(font)
         
-        # Style label text
-        self.label.setStyleSheet(f"color: {config.COLOR_TEXT}; line-height: 14px;")
+        # Style label text (Qt does not support CSS line-height on plain text QLabel)
+        self.label.setStyleSheet(f"color: {config.COLOR_TEXT};")
         layout.addWidget(self.label)
 
     def paintEvent(self, event):
